@@ -1,0 +1,14 @@
+[Unit]
+Description=Fix vagrant-libvirt network conflicts
+After=libvirtd.service
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/dev/code/edays-ansible-k8s/scripts/fix-libvirt-networks.sh
+RemainAfterExit=yes
+User=root
+
+[Install]
+WantedBy=multi-user.target
+

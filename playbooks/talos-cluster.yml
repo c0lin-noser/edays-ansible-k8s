@@ -1,0 +1,238 @@
+---
+- name: Setup Talos Cluster
+  hosts: localhost
+  gather_facts: no
+  vars:
+    talos_config_dir: "../.talos"
+
+  tasks:
+    - name: Create Talos configuration directory
+      file:
+        path: "{{ talos_config_dir }}"
+        state: directory
+        mode: '0755'
+
+
+    - name: Set controller and worker IPs from inventory
+      set_fact:
+        controller_ip: "{{ talos_controller_ips | first }}"
+        worker_ips: "{{ talos_worker_ips }}"
+
+    - name: Display discovered IPs
+      debug:
+        msg:
+          - "Controller IP: {{ controller_ip }}"
+          - "Worker IPs: {{ worker_ips }}"
+
+    - name: Check if Talos cluster is already running
+      shell: |
+        talosctl --talosconfig={{ talos_config_dir }}/talosconfig get members --insecure --nodes {{ controller_ip }} 2>/dev/null || echo "not_running"
+      register: cluster_status_check
+      failed_when: false
+      changed_when: false
+      ignore_errors: true
+
+    - name: Set cluster status
+      set_fact:
+        cluster_running: "{{ cluster_status_check.stdout_lines | length > 1 and cluster_status_check.stdout_lines[1] | length > 0 }}"
+
+    - name: Display cluster status
+      debug:
+        msg: "Cluster already running: {{ cluster_running }}"
+
+    - name: Generate Talos configurations
+      block:
+        - name: Generate Talos control plane configuration
+          command: >
+            talosctl gen config talos-cluster-controlplane
+            https://{{ controller_ip }}:6443
+            --output-dir {{ talos_config_dir }}
+            --install-disk /dev/vda
+            --force
+
+        - name: Generate Talos worker configuration
+          command: >
+            talosctl gen config talos-cluster-worker
+            https://{{ controller_ip }}:6443
+            --output-dir {{ talos_config_dir }}
+            --install-disk /dev/vda
+            --force
+
+        - name: Set endpoint in talosconfig
+          command: >
+            talosctl config endpoint {{ controller_ip }}
+            --talosconfig={{ talos_config_dir }}/talosconfig
+
+        - name: Set nodes in talosconfig
+          command: >
+            talosctl config nodes {{ controller_ip }} {{ worker_ips | join(' ') }}
+            --talosconfig={{ talos_config_dir }}/talosconfig
+      when: not cluster_running
+
+    - name: Apply Talos configurations and bootstrap cluster
+      block:
+        - name: Apply control plane configuration
+          command: >
+            talosctl apply-config
+            --nodes {{ controller_ip }}
+            --file {{ talos_config_dir }}/controlplane.yaml
+            --insecure
+
+        - name: Apply worker configurations
+          command: >
+            talosctl apply-config
+            --nodes {{ item }}
+            --file {{ talos_config_dir }}/worker.yaml
+            --insecure
+          loop: "{{ worker_ips }}"
+
+        - name: Wait for Talos to be ready for bootstrap
+          shell: |
+            talosctl --nodes {{ controller_ip }} --talosconfig={{ talos_config_dir }}/talosconfig services | awk '
+            $2 == "etcd" {
+              etcd_status = $3
+              etcd_event = substr($0, index($0, $7))
+            }
+            $2 == "kubelet" {
+              kubelet_status = $3
+              kubelet_event = substr($0, index($0, $7))
+            }
+            END {
+              if (etcd_status == "Preparing" && kubelet_status == "Running" &&
+                  etcd_event ~ /Running pre state/ && kubelet_event ~ /Health check successful/)
+                exit 0
+              else
+                exit 1
+            }'
+          register: talos_service_check
+          retries: 50
+          delay: 30
+          changed_when: false
+
+        - name: Bootstrap the cluster
+          command: >
+            talosctl bootstrap
+            --nodes {{ controller_ip }}
+            --talosconfig={{ talos_config_dir }}/talosconfig
+
+        - name: Wait for cluster to be healthy
+          command: >
+            talosctl health
+            --nodes {{ controller_ip }}
+            --talosconfig={{ talos_config_dir }}/talosconfig
+          register: talos_health_check
+          retries: 30
+          delay: 10
+          until: talos_health_check.rc == 0
+          changed_when: false
+
+        - name: Get kubeconfig
+          command: >
+            talosctl kubeconfig
+            --nodes {{ controller_ip }}
+            --talosconfig={{ talos_config_dir }}/talosconfig 
+            {{ talos_config_dir }}/kubeconfig
+      when: not cluster_running
+      
+    - name: Check if kubeconfig exists
+      stat:
+        path: "{{ talos_config_dir }}/kubeconfig"
+      register: kubeconfig_exists
+
+    - name: Wait for all nodes to be ready
+      command: "kubectl get nodes --kubeconfig={{ talos_config_dir }}/kubeconfig"
+      register: nodes_status
+      until: "'Ready' in nodes_status.stdout"
+      retries: 30
+      delay: 10
+      when: kubeconfig_exists.stat.exists or not cluster_running
+
+    - name: Display cluster status
+      command: "kubectl get nodes --kubeconfig={{ talos_config_dir }}/kubeconfig -o wide"
+      register: cluster_status
+      when: kubeconfig_exists.stat.exists or not cluster_running
+
+    - name: Show cluster status
+      debug:
+        var: cluster_status.stdout_lines
+
+- name: Deploy ArgoCD
+  hosts: localhost
+  gather_facts: no
+  vars:
+    kubeconfig_path: "{{ talos_config_dir }}/kubeconfig"
+  tasks:
+    - name: Check if kubeconfig exists for ArgoCD deployment
+      stat:
+        path: "{{ kubeconfig_path }}"
+      register: kubeconfig_check
+      changed_when: false
+
+    - name: Add ArgoCD Helm repository
+      kubernetes.core.helm_repository:
+        name: argo
+        repo_url: https://argoproj.github.io/helm-charts
+        kubeconfig: "{{ kubeconfig_path }}"
+      when: kubeconfig_check.stat.exists
+
+    - name: Create ArgoCD namespace
+      kubernetes.core.k8s:
+        name: argocd
+        api_version: v1
+        kind: Namespace
+        state: present
+        kubeconfig: "{{ kubeconfig_path }}"
+      when: kubeconfig_check.stat.exists
+
+    - name: Install ArgoCD with Helm
+      kubernetes.core.helm:
+        name: argocd
+        chart_ref: argo/argo-cd
+        release_namespace: argocd
+        create_namespace: true
+        values:
+          server:
+            service:
+              type: LoadBalancer
+        kubeconfig: "{{ kubeconfig_path }}"
+      when: kubeconfig_check.stat.exists
+
+- name: Deploy Chrony Server
+  hosts: localhost
+  gather_facts: no
+  vars:
+    kubeconfig_path: "{{ talos_config_dir }}/kubeconfig"
+  tasks:
+    - name: Check if kubeconfig exists for Chrony deployment
+      stat:
+        path: "{{ kubeconfig_path }}"
+      register: kubeconfig_check
+      changed_when: false
+
+    - name: Create Chrony namespace
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ lookup('file', 'manifests/chrony/namespace.yml') | from_yaml }}"
+        kubeconfig: "{{ kubeconfig_path }}"
+      when: kubeconfig_check.stat.exists
+
+    - name: Create Chrony ConfigMap
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ lookup('file', 'manifests/chrony/configmap.yml') | from_yaml }}"
+        kubeconfig: "{{ kubeconfig_path }}"
+      when: kubeconfig_check.stat.exists
+
+    - name: Create Chrony Deployment
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ lookup('file', 'manifests/chrony/deployment.yml') | from_yaml }}"
+        kubeconfig: "{{ kubeconfig_path }}"
+      when: kubeconfig_check.stat.exists
+
+    - name: Create Chrony Service
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ lookup('file', 'manifests/chrony/service.yml') | from_yaml }}"
+        kubeconfig: "{{ kubeconfig_path }}"
+      when: kubeconfig_check.stat.exists
